@@ -20,8 +20,10 @@ contract BankAutomation {
     uint256 public interval;
     
     // 事件
-    event UpkeepPerformed(uint256 timestamp, uint256 contractBalance);
+    event UpkeepPerformed(uint256 timestamp, uint256 contractBalance, uint256 transferAmount);
+    event UpkeepFailed(string reason, uint256 timestamp, uint256 contractBalance);
     event IntervalUpdated(uint256 newInterval);
+    event UpkeepConditionsChecked(bool timePassed, bool thresholdExceeded, bool autoTransferEnabled, uint256 contractBalance);
     
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner can call this function");
@@ -64,29 +66,57 @@ contract BankAutomation {
         // 检查自动转移是否启用
         bool autoTransferEnabled = bankContract.autoTransferEnabled();
         
-        upkeepNeeded = timePassed && thresholdExceeded && autoTransferEnabled;
-        performData = abi.encode(contractBalance, threshold);
+        // 检查Bank合约的冷却时间
+        uint256 lastAutoTransferTime = bankContract.lastAutoTransferTime();
+        uint256 autoTransferCooldown = bankContract.autoTransferCooldown();
+        bool cooldownPassed = autoTransferCooldown == 0 || (block.timestamp >= lastAutoTransferTime + autoTransferCooldown);
+        
+        // 检查最小转移金额
+        uint256 minimumTransferAmount = bankContract.minimumTransferAmount();
+        uint256 potentialTransferAmount = contractBalance / 2;
+        bool amountSufficient = potentialTransferAmount >= minimumTransferAmount;
+        
+        upkeepNeeded = timePassed && thresholdExceeded && autoTransferEnabled && cooldownPassed && amountSufficient;
+        performData = abi.encode(contractBalance, threshold, potentialTransferAmount);
     }
     
     /**
      * @dev ChainLink Automation执行函数
      * 当checkUpkeep返回true时执行
      */
-    function performUpkeep(bytes calldata /* performData */) external {
+    function performUpkeep(bytes calldata performData) external {
         // 重新验证条件
         (bool upkeepNeeded, ) = this.checkUpkeep("");
         require(upkeepNeeded, "Upkeep not needed");
+        
+        // 解析执行数据（如果有的话）
+        uint256 contractBalanceBefore = bankContract.getContractBalance();
+        if (performData.length > 0) {
+            try this.decodePerformData(performData) returns (uint256 balance, uint256, uint256) {
+                contractBalanceBefore = balance;
+            } catch {
+                // 如果解析失败，使用当前余额
+            }
+        }
         
         // 更新时间戳
         lastTimeStamp = block.timestamp;
         
         // 触发Bank合约的自动转移
         try bankContract.triggerAutoTransfer() {
-            uint256 contractBalance = bankContract.getContractBalance();
-            emit UpkeepPerformed(block.timestamp, contractBalance);
-        } catch {
-            // 如果调用失败，记录但不回滚
-            // 这样可以避免因为Bank合约问题导致整个upkeep失败
+            uint256 contractBalanceAfter = bankContract.getContractBalance();
+            uint256 actualTransferAmount = contractBalanceBefore > contractBalanceAfter ? 
+                contractBalanceBefore - contractBalanceAfter : 0;
+            
+            emit UpkeepPerformed(block.timestamp, contractBalanceAfter, actualTransferAmount);
+        } catch Error(string memory reason) {
+            emit UpkeepFailed(reason, block.timestamp, bankContract.getContractBalance());
+        } catch (bytes memory lowLevelData) {
+            emit UpkeepFailed(
+                string(abi.encodePacked("Low level error: ", lowLevelData)), 
+                block.timestamp, 
+                bankContract.getContractBalance()
+            );
         }
     }
     
@@ -106,11 +136,24 @@ contract BankAutomation {
      * @dev 手动触发upkeep（仅用于测试）
      */
     function manualUpkeep() external onlyOwner {
+        uint256 contractBalanceBefore = bankContract.getContractBalance();
         lastTimeStamp = block.timestamp;
-        bankContract.triggerAutoTransfer();
         
-        uint256 contractBalance = bankContract.getContractBalance();
-        emit UpkeepPerformed(block.timestamp, contractBalance);
+        try bankContract.triggerAutoTransfer() {
+            uint256 contractBalanceAfter = bankContract.getContractBalance();
+            uint256 actualTransferAmount = contractBalanceBefore > contractBalanceAfter ? 
+                contractBalanceBefore - contractBalanceAfter : 0;
+            
+            emit UpkeepPerformed(block.timestamp, contractBalanceAfter, actualTransferAmount);
+        } catch Error(string memory reason) {
+            emit UpkeepFailed(reason, block.timestamp, bankContract.getContractBalance());
+        } catch (bytes memory lowLevelData) {
+            emit UpkeepFailed(
+                string(abi.encodePacked("Manual upkeep failed: ", lowLevelData)), 
+                block.timestamp, 
+                bankContract.getContractBalance()
+            );
+        }
     }
     
     /**
@@ -138,5 +181,20 @@ contract BankAutomation {
      */
     function getNextCheckTime() external view returns (uint256 nextCheckTime) {
         nextCheckTime = lastTimeStamp + interval;
+    }
+    
+    /**
+     * @dev 解析performData的辅助函数
+     * @param data 要解析的数据
+     * @return balance 合约余额
+     * @return threshold 阈值
+     * @return transferAmount 转移金额
+     */
+    function decodePerformData(bytes calldata data) external pure returns (
+        uint256 balance,
+        uint256 threshold,
+        uint256 transferAmount
+    ) {
+        (balance, threshold, transferAmount) = abi.decode(data, (uint256, uint256, uint256));
     }
 }

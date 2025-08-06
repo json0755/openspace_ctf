@@ -21,6 +21,15 @@ contract Bank {
     // 是否启用自动转移
     bool public autoTransferEnabled;
     
+    // 最小转移金额（防止频繁小额转移）
+    uint256 public minimumTransferAmount;
+    
+    // 上次自动转移时间（防止过于频繁执行）
+    uint256 public lastAutoTransferTime;
+    
+    // 自动转移冷却时间（秒）
+    uint256 public autoTransferCooldown;
+    
     // 事件定义
     event Deposit(address indexed user, uint256 amount);
     event Withdraw(address indexed user, uint256 amount);
@@ -29,6 +38,9 @@ contract Bank {
     event ThresholdUpdated(uint256 newThreshold);
     event AutoTransferTargetUpdated(address indexed newTarget);
     event AutoTransferToggled(bool enabled);
+    event MinimumTransferAmountUpdated(uint256 newAmount);
+    event AutoTransferCooldownUpdated(uint256 newCooldown);
+    event AutoTransferSkipped(string reason, uint256 contractBalance);
     
     // 修饰符：只有拥有者可以调用
     modifier onlyOwner() {
@@ -52,6 +64,9 @@ contract Bank {
         autoTransferThreshold = _threshold;
         autoTransferTarget = _target;
         autoTransferEnabled = true;
+        minimumTransferAmount = 0.01 ether; // 默认最小转移金额
+        autoTransferCooldown = 0; // 默认无冷却时间，可通过setAutoTransferCooldown设置
+        lastAutoTransferTime = 0;
     }
     
     /**
@@ -129,6 +144,35 @@ contract Bank {
     }
     
     /**
+     * @dev 获取所有用户余额总和（用于一致性检查）
+     * 注意：这个函数在实际应用中可能gas消耗很高，仅用于调试和测试
+     * @param users 要检查的用户地址数组
+     * @return totalUserBalances 用户余额总和
+     */
+    function getTotalUserBalances(address[] memory users) public view returns (uint256 totalUserBalances) {
+        for (uint256 i = 0; i < users.length; i++) {
+            totalUserBalances += balances[users[i]];
+        }
+    }
+    
+    /**
+     * @dev 检查余额一致性
+     * @param users 要检查的用户地址数组
+     * @return isConsistent 余额是否一致
+     * @return contractBalance 合约实际余额
+     * @return userBalancesSum 用户余额总和
+     */
+    function checkBalanceConsistency(address[] memory users) public view returns (
+        bool isConsistent,
+        uint256 contractBalance,
+        uint256 userBalancesSum
+    ) {
+        contractBalance = address(this).balance;
+        userBalancesSum = getTotalUserBalances(users);
+        isConsistent = userBalancesSum <= contractBalance;
+    }
+    
+    /**
      * @dev 紧急提取函数（仅拥有者）
      * 拥有者可以提取合约中的所有资金
      */
@@ -169,6 +213,26 @@ contract Bank {
     }
     
     /**
+     * @dev 设置最小转移金额（仅拥有者）
+     * @param _amount 新的最小转移金额
+     */
+    function setMinimumTransferAmount(uint256 _amount) public onlyOwner {
+        require(_amount > 0, "Minimum transfer amount must be greater than 0");
+        minimumTransferAmount = _amount;
+        emit MinimumTransferAmountUpdated(_amount);
+    }
+    
+    /**
+     * @dev 设置自动转移冷却时间（仅拥有者）
+     * @param _cooldown 新的冷却时间（秒）
+     */
+    function setAutoTransferCooldown(uint256 _cooldown) public onlyOwner {
+        require(_cooldown >= 60, "Cooldown must be at least 60 seconds");
+        autoTransferCooldown = _cooldown;
+        emit AutoTransferCooldownUpdated(_cooldown);
+    }
+    
+    /**
      * @dev 手动触发自动转移检查（仅拥有者）
      */
     function manualAutoTransfer() public onlyOwner {
@@ -187,17 +251,37 @@ contract Bank {
      */
     function _checkAndExecuteAutoTransfer() internal {
         if (!autoTransferEnabled || autoTransferTarget == address(0)) {
+            emit AutoTransferSkipped("Auto transfer disabled or target not set", address(this).balance);
+            return;
+        }
+        
+        // 检查冷却时间（如果设置了冷却时间）
+        if (autoTransferCooldown > 0 && block.timestamp < lastAutoTransferTime + autoTransferCooldown) {
+            emit AutoTransferSkipped("Cooldown period not elapsed", address(this).balance);
             return;
         }
         
         uint256 contractBalance = address(this).balance;
-        if (contractBalance >= autoTransferThreshold) {
-            uint256 transferAmount = contractBalance / 2;
-            
-            (bool success, ) = payable(autoTransferTarget).call{value: transferAmount}("");
-            if (success) {
-                emit AutoTransfer(transferAmount, autoTransferTarget);
-            }
+        if (contractBalance < autoTransferThreshold) {
+            emit AutoTransferSkipped("Balance below threshold", contractBalance);
+            return;
+        }
+        
+        uint256 transferAmount = contractBalance / 2;
+        
+        // 检查最小转移金额
+        if (transferAmount < minimumTransferAmount) {
+            emit AutoTransferSkipped("Transfer amount below minimum", contractBalance);
+            return;
+        }
+        
+        // 执行转移
+        (bool success, ) = payable(autoTransferTarget).call{value: transferAmount}("");
+        if (success) {
+            lastAutoTransferTime = block.timestamp;
+            emit AutoTransfer(transferAmount, autoTransferTarget);
+        } else {
+            emit AutoTransferSkipped("Transfer failed", contractBalance);
         }
     }
     

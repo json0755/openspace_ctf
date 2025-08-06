@@ -322,9 +322,9 @@ contract BankAutomationTest is Test {
         // 时间推进
         vm.warp(block.timestamp + INTERVAL + 1);
         
-        // 期望触发UpkeepPerformed事件（转移后的余额）
-        vm.expectEmit(true, true, false, true);
-        emit BankAutomation.UpkeepPerformed(block.timestamp, 3 ether);
+        // 期望触发UpkeepPerformed事件（转移后的余额和转移金额）
+        vm.expectEmit(true, true, true, true);
+        emit BankAutomation.UpkeepPerformed(block.timestamp, 3 ether, 3 ether);
         
         automation.performUpkeep("");
     }
